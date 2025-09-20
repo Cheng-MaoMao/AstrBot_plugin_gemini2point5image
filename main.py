@@ -269,7 +269,7 @@ class MyPlugin(Star):
             
             # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
-                image_path = await send_file(image_path, HOST=nap_server_address, PORT=nap_server_port)
+                image_path = await send_file(image_path, host=nap_server_address, port=nap_server_port)
             
             # 使用新的发送方法，优先使用callback_api_base
             image_component = await self.send_image_with_callback_api(image_path)
@@ -455,7 +455,7 @@ Please ensure the final result looks like a real commercial figure product that 
             
             # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
-                image_path = await send_file(image_path, HOST=self.nap_server_address, PORT=self.nap_server_port)
+                image_path = await send_file(image_path, host=self.nap_server_address, port=self.nap_server_port)
             
             # 发送处理结果
             image_component = await self.send_image_with_callback_api(image_path)
