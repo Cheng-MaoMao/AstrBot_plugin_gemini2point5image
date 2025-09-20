@@ -1,11 +1,12 @@
 import json
 import os
 from datetime import datetime
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, llm_tool
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, sp
-from astrbot.api.all import *
+from astrbot.api.message_components import Image, Plain
 from astrbot.core.message.components import Reply
+from astrbot.api.all import *
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
@@ -269,7 +270,7 @@ class MyPlugin(Star):
             
             # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
-                image_path = await send_file(image_path, host=nap_server_address, port=nap_server_port)
+                image_path = await send_file(image_path, host=self.nap_server_address, port=self.nap_server_port)
             
             # 使用新的发送方法，优先使用callback_api_base
             image_component = await self.send_image_with_callback_api(image_path)
