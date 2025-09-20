@@ -9,7 +9,7 @@ from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.9")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "2.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -91,49 +91,61 @@ class MyPlugin(Star):
         user_id = event.get_sender_id()
         group_id = event.get_group_id()
         
-        # 确定适用的限制
+        # 确定适用的限制和重置周期
         limit = self.rate_limit_config.get("default_limit", 10)
-        
+        reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
+        limit_type = "默认"
+
         # 优先用户限制
         user_limits = self.rate_limit_config.get("user_limits", [])
         if isinstance(user_limits, list):
             user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
             if user_limit_config:
                 limit = user_limit_config.get("limit", limit)
+                limit_type = "用户"
         else:
             logger.warning("配置中的 user_limits 格式不正确，应为列表")
 
-        # 其次群组限制
-        group_limits = self.rate_limit_config.get("group_limits", [])
-        if isinstance(group_limits, list):
-            group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
-            if group_limit_config:
-                limit = group_limit_config.get("limit", limit)
-        else:
-            logger.warning("配置中的 group_limits 格式不正确，应为列表")
+        # 其次群组限制 (仅当不是用户特定限制时)
+        if limit_type != "用户":
+            group_limits = self.rate_limit_config.get("group_limits", [])
+            if isinstance(group_limits, list):
+                group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
+                if group_limit_config:
+                    limit = group_limit_config.get("limit", limit)
+                    limit_type = "群组"
+            else:
+                logger.warning("配置中的 group_limits 格式不正确，应为列表")
 
         # 检查使用记录
-        today = datetime.now().strftime("%Y-%m-%d")
-        record_key = f"user_{user_id}" if group_id else f"user_{user_id}" # 私聊和群聊都基于用户ID
-        if group_id:
-             record_key = f"group_{group_id}" # 群聊基于群ID
+        current_timestamp = int(datetime.now().timestamp())
+        record_key = f"group_{group_id}" if group_id else f"user_{user_id}"
 
-        user_record = self.usage_records.get(record_key, {"date": today, "count": 0})
+        user_record = self.usage_records.get(record_key, {"timestamp": current_timestamp, "count": 0})
 
-        # 如果日期不是今天，重置计数
-        if user_record.get("date") != today:
-            user_record = {"date": today, "count": 0}
+        # 检查是否需要重置计数
+        time_since_last_draw = (current_timestamp - user_record.get("timestamp", 0)) / 60
+        if time_since_last_draw > reset_interval:
+            user_record = {"timestamp": current_timestamp, "count": 0}
 
         if user_record["count"] >= limit:
-            return False, f"您今天已经达到绘图次数上限（{limit}次），请明天再来吧。"
+            return False, f"您已达到绘图次数上限（{limit}次），请稍后再试。"
 
         # 更新记录
         user_record["count"] += 1
+        user_record["timestamp"] = current_timestamp # 每次使用都更新时间戳
         self.usage_records[record_key] = user_record
         self._save_usage_records()
 
         remaining = limit - user_record["count"]
-        return True, f"绘图成功！您今天还剩余 {remaining} 次绘图机会。"
+        
+        # 构建提示消息
+        if limit_type == "用户":
+            message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
+        else:
+            message = f"绘图成功！您今天还剩余 {remaining} 次绘图机会。"
+            
+        return True, message
 
     async def send_image_with_callback_api(self, image_path: str) -> Image:
         """

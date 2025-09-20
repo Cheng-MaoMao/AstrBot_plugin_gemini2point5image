@@ -54,6 +54,11 @@
                 "type": "int",
                 "default": 10
             },
+            "reset_interval_minutes": {
+                "description": "绘图次数重置周期（分钟）",
+                "type": "int",
+                "default": 1440
+            },
             "group_limits": {
                 "description": "特定群组的每日绘图次数限制",
                 "type": "list",
