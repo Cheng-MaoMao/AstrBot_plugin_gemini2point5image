@@ -130,33 +130,37 @@ class MyPlugin(Star):
         user_id = event.get_sender_id()
         group_id = event.get_group_id()
         
-        # 3. 确定适用的限制规则和重置周期
-        # 默认限制为10次，默认重置周期为1440分钟（24小时）
-        limit = self.rate_limit_config.get("default_limit", 10)
+        # 3. 确定限制规则
+        # 默认不限制，只有在配置中明确指定的用户或群组才会受到限制
+        limit = None
+        limit_type = None
         reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
-        limit_type = "默认" # 用于后续生成个性化提示
 
-        # 规则优先级：用户特定限制 > 群组特定限制 > 默认限制
+        # 规则优先级：用户特定限制 > 群组特定限制
         # 检查是否存在针对该用户的特定限制
         user_limits = self.rate_limit_config.get("user_limits", [])
         if isinstance(user_limits, list):
             user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
             if user_limit_config:
-                limit = user_limit_config.get("limit", limit)
+                limit = user_limit_config.get("limit")
                 limit_type = "用户"
         else:
             logger.warning("配置中的 user_limits 格式不正确，应为列表")
 
         # 如果没有用户特定限制，再检查是否存在针对该群组的限制
-        if limit_type != "用户" and group_id:
+        if limit is None and group_id:
             group_limits = self.rate_limit_config.get("group_limits", [])
             if isinstance(group_limits, list):
                 group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
                 if group_limit_config:
-                    limit = group_limit_config.get("limit", limit)
+                    limit = group_limit_config.get("limit")
                     limit_type = "群组"
             else:
                 logger.warning("配置中的 group_limits 格式不正确，应为列表")
+
+        # 如果用户或群组未在任何限制列表中找到，则不限制
+        if limit is None:
+            return True, ""
 
         # 4. 检查并处理使用记录
         current_timestamp = int(datetime.now().timestamp())
@@ -191,62 +195,6 @@ class MyPlugin(Star):
             message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
         else:
             message = f"绘图成功！您还剩余 {remaining} 次绘图机会。"
-            
-        return True, message
-        
-        # 确定适用的限制和重置周期
-        limit = self.rate_limit_config.get("default_limit", 10)
-        reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
-        limit_type = "默认"
-
-        # 优先用户限制
-        user_limits = self.rate_limit_config.get("user_limits", [])
-        if isinstance(user_limits, list):
-            user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
-            if user_limit_config:
-                limit = user_limit_config.get("limit", limit)
-                limit_type = "用户"
-        else:
-            logger.warning("配置中的 user_limits 格式不正确，应为列表")
-
-        # 其次群组限制 (仅当不是用户特定限制时)
-        if limit_type != "用户":
-            group_limits = self.rate_limit_config.get("group_limits", [])
-            if isinstance(group_limits, list):
-                group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
-                if group_limit_config:
-                    limit = group_limit_config.get("limit", limit)
-                    limit_type = "群组"
-            else:
-                logger.warning("配置中的 group_limits 格式不正确，应为列表")
-
-        # 检查使用记录
-        current_timestamp = int(datetime.now().timestamp())
-        record_key = f"group_{group_id}" if group_id else f"user_{user_id}"
-
-        user_record = self.usage_records.get(record_key, {"timestamp": current_timestamp, "count": 0})
-
-        # 检查是否需要重置计数
-        time_since_last_draw = (current_timestamp - user_record.get("timestamp", 0)) / 60
-        if time_since_last_draw > reset_interval:
-            user_record = {"timestamp": current_timestamp, "count": 0}
-
-        if user_record["count"] >= limit:
-            return False, f"您已达到绘图次数上限（{limit}次），请稍后再试。"
-
-        # 更新记录
-        user_record["count"] += 1
-        user_record["timestamp"] = current_timestamp # 每次使用都更新时间戳
-        self.usage_records[record_key] = user_record
-        self._save_usage_records()
-
-        remaining = limit - user_record["count"]
-        
-        # 构建提示消息
-        if limit_type == "用户":
-            message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
-        else:
-            message = f"绘图成功！您今天还剩余 {remaining} 次绘图机会。"
             
         return True, message
 
