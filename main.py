@@ -9,36 +9,52 @@ from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "2.0")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "2.1")
 class MyPlugin(Star):
+    """
+    一个使用OpenRouter API和Gemini模型生成图像的AstrBot插件。
+    支持多API密钥轮换、自定义模型、参考图生成、绘图次数限制等功能。
+    """
     def __init__(self, context: Context, config: dict):
+        """
+        插件初始化函数。
+        - 加载配置，包括API密钥、模型名称、服务器地址等。
+        - 初始化绘图次数限制功能，加载历史使用记录。
+        """
         super().__init__(context)
-        # 支持多个API密钥
+        # --- API与模型配置 ---
+        # 支持多个API密钥，实现自动轮换
         self.openrouter_api_keys = config.get("openrouter_api_keys", [])
-        # 向后兼容：如果还在使用旧的单个API密钥配置
+        # 向后兼容：如果还在使用旧的单个API密钥配置，自动迁移
         old_api_key = config.get("openrouter_api_key")
         if old_api_key and not self.openrouter_api_keys:
             self.openrouter_api_keys = [old_api_key]
         
-        # 自定义API base支持 - 优先从配置文件加载，全局配置会在命令中覆盖
+        # 自定义API base URL，用于支持代理或私有部署
         self.custom_api_base = config.get("custom_api_base", "").strip()
         
-        # 模型配置 - 优先从配置文件加载，全局配置会在命令中覆盖
+        # 使用的AI模型名称
         self.model_name = config.get("model_name", "google/gemini-2.5-flash-image-preview:free").strip()
         
-        # 重试配置
+        # API请求失败时的最大重试次数
         self.max_retry_attempts = config.get("max_retry_attempts", 3)
         
+        # --- 文件传输服务器配置 ---
+        # 用于在不同服务器间传输生成的图片文件
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
 
-        # 绘图限制配置
+        # --- 绘图次数限制功能配置 ---
+        # 加载完整的频率限制配置
         self.rate_limit_config = config.get("rate_limit", {})
+        # 初始化一个空字典，用于在内存中存储使用记录
         self.usage_records = {}
+        # 定义使用记录的持久化存储路径，位于AstrBot的data目录下，保证插件更新时数据不丢失
         self.usage_records_path = os.path.join("data", "gemini-25-image-openrouter", "usage_records.json")
+        # 插件启动时，从文件中加载历史使用记录
         self._load_usage_records()
         
-        # 标记是否已经加载过全局配置
+        # 标记是否已经加载过全局配置，避免重复加载
         self._global_config_loaded = False
 
     async def _load_global_config(self):
@@ -64,19 +80,30 @@ class MyPlugin(Star):
             self._global_config_loaded = True  # 即使失败也标记为已加载，避免重复尝试
 
     def _load_usage_records(self):
-        """加载使用记录"""
+        """
+        从JSON文件加载绘图使用记录到内存。
+        - 如果记录文件存在，则读取内容。
+        - 如果文件或目录不存在，则会自动创建，确保首次启动时能正常工作。
+        - 捕获并记录任何可能的异常，防止因文件问题导致插件加载失败。
+        """
         try:
             if os.path.exists(self.usage_records_path):
                 with open(self.usage_records_path, "r", encoding="utf-8") as f:
                     self.usage_records = json.load(f)
+                    logger.info("成功加载绘图使用记录。")
             else:
-                # 如果文件不存在，创建目录
+                # 如果数据文件不存在，则创建其所在的目录
                 os.makedirs(os.path.dirname(self.usage_records_path), exist_ok=True)
+                logger.info(f"使用记录文件不存在，已创建目录: {os.path.dirname(self.usage_records_path)}")
         except Exception as e:
             logger.error(f"加载绘图使用记录失败: {e}")
 
     def _save_usage_records(self):
-        """保存使用记录"""
+        """
+        将内存中的使用记录保存到JSON文件。
+        - 使用json.dump进行序列化，并设置格式使其更具可读性。
+        - 捕获并记录任何可能的异常，如磁盘无空间或无写入权限。
+        """
         try:
             with open(self.usage_records_path, "w", encoding="utf-8") as f:
                 json.dump(self.usage_records, f, ensure_ascii=False, indent=4)
@@ -84,12 +111,88 @@ class MyPlugin(Star):
             logger.error(f"保存绘图使用记录失败: {e}")
 
     async def _check_and_update_limit(self, event: AstrMessageEvent) -> tuple[bool, str]:
-        """检查并更新绘图次数限制"""
+        """
+        检查并更新用户的绘图次数限制。这是实现频率控制的核心函数。
+
+        Args:
+            event (AstrMessageEvent): 消息事件对象，用于获取用户信息。
+
+        Returns:
+            tuple[bool, str]: 一个元组，第一个元素表示是否允许绘图（布尔值），
+                              第二个元素是返回给用户的提示消息（字符串）。
+        """
+        # 1. 检查功能是否启用
+        # 如果在配置中未启用频率限制，则直接允许绘图，不进行任何检查。
         if not self.rate_limit_config.get("enabled", False):
             return True, ""
 
+        # 2. 获取用户信息
         user_id = event.get_sender_id()
         group_id = event.get_group_id()
+        
+        # 3. 确定适用的限制规则和重置周期
+        # 默认限制为10次，默认重置周期为1440分钟（24小时）
+        limit = self.rate_limit_config.get("default_limit", 10)
+        reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
+        limit_type = "默认" # 用于后续生成个性化提示
+
+        # 规则优先级：用户特定限制 > 群组特定限制 > 默认限制
+        # 检查是否存在针对该用户的特定限制
+        user_limits = self.rate_limit_config.get("user_limits", [])
+        if isinstance(user_limits, list):
+            user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
+            if user_limit_config:
+                limit = user_limit_config.get("limit", limit)
+                limit_type = "用户"
+        else:
+            logger.warning("配置中的 user_limits 格式不正确，应为列表")
+
+        # 如果没有用户特定限制，再检查是否存在针对该群组的限制
+        if limit_type != "用户" and group_id:
+            group_limits = self.rate_limit_config.get("group_limits", [])
+            if isinstance(group_limits, list):
+                group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
+                if group_limit_config:
+                    limit = group_limit_config.get("limit", limit)
+                    limit_type = "群组"
+            else:
+                logger.warning("配置中的 group_limits 格式不正确，应为列表")
+
+        # 4. 检查并处理使用记录
+        current_timestamp = int(datetime.now().timestamp())
+        # 根据是群聊还是私聊，确定用于在记录文件中索引的键
+        record_key = f"group_{group_id}" if group_id else f"user_{user_id}"
+
+        # 从内存中获取该用户/群组的记录，如果不存在则创建一个新的记录
+        user_record = self.usage_records.get(record_key, {"timestamp": current_timestamp, "count": 0})
+
+        # 检查距离上次使用是否超过了重置周期
+        time_since_last_draw = (current_timestamp - user_record.get("timestamp", 0)) / 60
+        if time_since_last_draw > reset_interval:
+            # 如果超过了重置周期，则将计数清零
+            user_record = {"timestamp": current_timestamp, "count": 0}
+
+        # 判断次数是否已达上限
+        if user_record["count"] >= limit:
+            return False, f"您已达到绘图次数上限（{limit}次），请稍后再试。"
+
+        # 5. 更新并保存记录
+        # 如果次数未满，则将计数加一，并更新时间戳
+        user_record["count"] += 1
+        user_record["timestamp"] = current_timestamp 
+        self.usage_records[record_key] = user_record
+        self._save_usage_records() # 持久化到文件
+
+        # 6. 构建返回消息
+        remaining = limit - user_record["count"]
+        
+        # 根据限制类型生成不同的提示消息，增强用户体验
+        if limit_type == "用户":
+            message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
+        else:
+            message = f"绘图成功！您还剩余 {remaining} 次绘图机会。"
+            
+        return True, message
         
         # 确定适用的限制和重置周期
         limit = self.rate_limit_config.get("default_limit", 10)
@@ -486,3 +589,11 @@ Please ensure the final result looks like a real commercial figure product that 
             logger.error(f"手办化处理过程出现未预期的错误: {e}")
             error_chain = [Plain(f"手办化处理失败: {str(e)}")]
             yield event.chain_result(error_chain)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("reset_images")
+    async def reset_images_command(self, event: AstrMessageEvent):
+        """重置所有用户和群组的绘画次数"""
+        self.usage_records = {}
+        self._save_usage_records()
+        yield event.plain_result("所有用户和群组的绘图次数已成功重置。")
