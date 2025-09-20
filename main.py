@@ -9,7 +9,7 @@ from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "2.2")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "2.1")
 class MyPlugin(Star):
     """
     一个使用OpenRouter API和Gemini模型生成图像的AstrBot插件。
@@ -23,43 +23,61 @@ class MyPlugin(Star):
         """
         super().__init__(context)
         # --- API与模型配置 ---
+        # 支持多个API密钥，实现自动轮换
         self.openrouter_api_keys = config.get("openrouter_api_keys", [])
+        # 向后兼容：如果还在使用旧的单个API密钥配置，自动迁移
         old_api_key = config.get("openrouter_api_key")
         if old_api_key and not self.openrouter_api_keys:
             self.openrouter_api_keys = [old_api_key]
         
+        # 自定义API base URL，用于支持代理或私有部署
         self.custom_api_base = config.get("custom_api_base", "").strip()
+        
+        # 使用的AI模型名称
         self.model_name = config.get("model_name", "google/gemini-2.5-flash-image-preview:free").strip()
+        
+        # API请求失败时的最大重试次数
         self.max_retry_attempts = config.get("max_retry_attempts", 3)
         
         # --- 文件传输服务器配置 ---
+        # 用于在不同服务器间传输生成的图片文件
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
 
         # --- 绘图次数限制功能配置 ---
+        # 加载完整的频率限制配置
         self.rate_limit_config = config.get("rate_limit", {})
+        # 初始化一个空字典，用于在内存中存储使用记录
         self.usage_records = {}
+        # 定义使用记录的持久化存储路径，位于AstrBot的data目录下，保证插件更新时数据不丢失
         self.usage_records_path = os.path.join("data", "gemini-25-image-openrouter", "usage_records.json")
+        # 插件启动时，从文件中加载历史使用记录
         self._load_usage_records()
         
+        # 标记是否已经加载过全局配置，避免重复加载
         self._global_config_loaded = False
 
     async def _load_global_config(self):
         """异步加载全局配置"""
         if self._global_config_loaded:
             return
+            
         try:
             plugin_config = await sp.global_get("gemini-25-image-openrouter", {})
+            
+            # 如果全局配置中有设置，则覆盖当前配置
             if "custom_api_base" in plugin_config:
                 self.custom_api_base = plugin_config["custom_api_base"]
                 logger.info(f"从全局配置加载 custom_api_base: {self.custom_api_base}")
+                
             if "model_name" in plugin_config:
                 self.model_name = plugin_config["model_name"]
                 logger.info(f"从全局配置加载 model_name: {self.model_name}")
+                
             self._global_config_loaded = True
         except Exception as e:
             logger.error(f"加载全局配置失败: {e}")
-            self._global_config_loaded = True
+            self._global_config_loaded = True  # 即使失败也标记为已加载，避免重复尝试
 
     def _load_usage_records(self):
         """
@@ -74,6 +92,7 @@ class MyPlugin(Star):
                     self.usage_records = json.load(f)
                     logger.info("成功加载绘图使用记录。")
             else:
+                # 如果数据文件不存在，则创建其所在的目录
                 os.makedirs(os.path.dirname(self.usage_records_path), exist_ok=True)
                 logger.info(f"使用记录文件不存在，已创建目录: {os.path.dirname(self.usage_records_path)}")
         except Exception as e:
@@ -81,7 +100,7 @@ class MyPlugin(Star):
 
     def _save_usage_records(self):
         """
-        将内存中的使用记录保存到JSON文件。将内存中的使用记录保存到JSON文件。
+        将内存中的使用记录保存到JSON文件。
         - 使用json.dump进行序列化，并设置格式使其更具可读性。
         - 捕获并记录任何可能的异常，如磁盘无空间或无写入权限。
         """
@@ -93,45 +112,121 @@ class MyPlugin(Star):
 
     async def _check_and_update_limit(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """
-        检查并更新用户的绘图次数限制。采用“黑名单”模式。
+        检查并更新用户的绘图次数限制。这是实现频率控制的核心函数。
+
+        Args:
+            event (AstrMessageEvent): 消息事件对象，用于获取用户信息。
+
+        Returns:
+            tuple[bool, str]: 一个元组，第一个元素表示是否允许绘图（布尔值），
+                              第二个元素是返回给用户的提示消息（字符串）。
         """
+        # 1. 检查功能是否启用
+        # 如果在配置中未启用频率限制，则直接允许绘图，不进行任何检查。
         if not self.rate_limit_config.get("enabled", False):
             return True, ""
 
+        # 2. 获取用户信息
         user_id = event.get_sender_id()
         group_id = event.get_group_id()
         
-        limit = -1
-        limit_type = None
-        
+        # 3. 确定适用的限制规则和重置周期
+        # 默认限制为10次，默认重置周期为1440分钟（24小时）
+        limit = self.rate_limit_config.get("default_limit", 10)
+        reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
+        limit_type = "默认" # 用于后续生成个性化提示
+
+        # 规则优先级：用户特定限制 > 群组特定限制 > 默认限制
+        # 检查是否存在针对该用户的特定限制
         user_limits = self.rate_limit_config.get("user_limits", [])
         if isinstance(user_limits, list):
             user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
             if user_limit_config:
-                limit = user_limit_config.get("limit", self.rate_limit_config.get("default_limit", 10))
+                limit = user_limit_config.get("limit", limit)
                 limit_type = "用户"
         else:
             logger.warning("配置中的 user_limits 格式不正确，应为列表")
 
-        if limit_type is None and group_id:
+        # 如果没有用户特定限制，再检查是否存在针对该群组的限制
+        if limit_type != "用户" and group_id:
             group_limits = self.rate_limit_config.get("group_limits", [])
             if isinstance(group_limits, list):
                 group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
                 if group_limit_config:
-                    limit = group_limit_config.get("limit", self.rate_limit_config.get("default_limit", 10))
+                    limit = group_limit_config.get("limit", limit)
                     limit_type = "群组"
             else:
                 logger.warning("配置中的 group_limits 格式不正确，应为列表")
 
-        if limit_type is None:
-            return True, ""
+        # 4. 检查并处理使用记录
+        current_timestamp = int(datetime.now().timestamp())
+        # 根据是群聊还是私聊，确定用于在记录文件中索引的键
+        record_key = f"group_{group_id}" if group_id else f"user_{user_id}"
 
+        # 从内存中获取该用户/群组的记录，如果不存在则创建一个新的记录
+        user_record = self.usage_records.get(record_key, {"timestamp": current_timestamp, "count": 0})
+
+        # 检查距离上次使用是否超过了重置周期
+        time_since_last_draw = (current_timestamp - user_record.get("timestamp", 0)) / 60
+        if time_since_last_draw > reset_interval:
+            # 如果超过了重置周期，则将计数清零
+            user_record = {"timestamp": current_timestamp, "count": 0}
+
+        # 判断次数是否已达上限
+        if user_record["count"] >= limit:
+            return False, f"您已达到绘图次数上限（{limit}次），请稍后再试。"
+
+        # 5. 更新并保存记录
+        # 如果次数未满，则将计数加一，并更新时间戳
+        user_record["count"] += 1
+        user_record["timestamp"] = current_timestamp 
+        self.usage_records[record_key] = user_record
+        self._save_usage_records() # 持久化到文件
+
+        # 6. 构建返回消息
+        remaining = limit - user_record["count"]
+        
+        # 根据限制类型生成不同的提示消息，增强用户体验
+        if limit_type == "用户":
+            message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
+        else:
+            message = f"绘图成功！您还剩余 {remaining} 次绘图机会。"
+            
+        return True, message
+        
+        # 确定适用的限制和重置周期
+        limit = self.rate_limit_config.get("default_limit", 10)
         reset_interval = self.rate_limit_config.get("reset_interval_minutes", 1440)
+        limit_type = "默认"
+
+        # 优先用户限制
+        user_limits = self.rate_limit_config.get("user_limits", [])
+        if isinstance(user_limits, list):
+            user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
+            if user_limit_config:
+                limit = user_limit_config.get("limit", limit)
+                limit_type = "用户"
+        else:
+            logger.warning("配置中的 user_limits 格式不正确，应为列表")
+
+        # 其次群组限制 (仅当不是用户特定限制时)
+        if limit_type != "用户":
+            group_limits = self.rate_limit_config.get("group_limits", [])
+            if isinstance(group_limits, list):
+                group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
+                if group_limit_config:
+                    limit = group_limit_config.get("limit", limit)
+                    limit_type = "群组"
+            else:
+                logger.warning("配置中的 group_limits 格式不正确，应为列表")
+
+        # 检查使用记录
         current_timestamp = int(datetime.now().timestamp())
         record_key = f"group_{group_id}" if group_id else f"user_{user_id}"
 
         user_record = self.usage_records.get(record_key, {"timestamp": current_timestamp, "count": 0})
 
+        # 检查是否需要重置计数
         time_since_last_draw = (current_timestamp - user_record.get("timestamp", 0)) / 60
         if time_since_last_draw > reset_interval:
             user_record = {"timestamp": current_timestamp, "count": 0}
@@ -139,23 +234,25 @@ class MyPlugin(Star):
         if user_record["count"] >= limit:
             return False, f"您已达到绘图次数上限（{limit}次），请稍后再试。"
 
+        # 更新记录
         user_record["count"] += 1
-        user_record["timestamp"] = current_timestamp
+        user_record["timestamp"] = current_timestamp # 每次使用都更新时间戳
         self.usage_records[record_key] = user_record
         self._save_usage_records()
 
         remaining = limit - user_record["count"]
         
+        # 构建提示消息
         if limit_type == "用户":
             message = f"用户({user_id})绘图成功！您还剩余 {remaining} 次绘图机会。"
         else:
-            message = f"绘图成功！您还剩余 {remaining} 次绘图机会。"
+            message = f"绘图成功！您今天还剩余 {remaining} 次绘图机会。"
             
         return True, message
 
     async def send_image_with_callback_api(self, image_path: str) -> Image:
         """
-         优先使用callback_api_base发送图片，失败则退回到本地文件发送
+        优先使用callback_api_base发送图片，失败则退回到本地文件发送
         
         Args:
             image_path (str): 图片文件路径
@@ -187,7 +284,7 @@ class MyPlugin(Star):
     @filter.llm_tool(name="gemini-pic-gen")
     async def pic_gen(self, event: AstrMessageEvent, image_description: str, use_reference_images: bool = True):
         """
-             Generate or modify images using the Gemini model via the OpenRouter API.
+            Generate or modify images using the Gemini model via the OpenRouter API.
             When a user requests image generation or drawing, call this function.
             If use_reference_images is True and the user has provided images in their message,
             those images will be used as references for generation or modification.
@@ -218,56 +315,98 @@ class MyPlugin(Star):
             - image_description (string): Description of the image to generate. Translate to English can be better.
             - use_reference_images (bool): Whether to use images from the user's message as reference. Default True.
         """
+        # 检查频率限制
         can_draw, message = await self._check_and_update_limit(event)
         if not can_draw:
             yield event.plain_result(message)
             return
 
+        # 加载全局配置，确保使用最新的配置
         await self._load_global_config()
         
+        openrouter_api_keys = self.openrouter_api_keys
+        nap_server_address = self.nap_server_address
+        nap_server_port = self.nap_server_port
+
+        # 根据参数决定是否使用参考图片
         input_images = []
         if use_reference_images:
+            # 从当前对话上下文中获取图片信息
             if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'message'):
                 for comp in event.message_obj.message:
                     if isinstance(comp, Image):
                         try:
-                            input_images.append(await comp.convert_to_base64())
-                        except Exception as e:
+                            base64_data = await comp.convert_to_base64()
+                            input_images.append(base64_data)
+                        except (IOError, ValueError, OSError) as e:
                             logger.warning(f"转换当前消息中的参考图片到base64失败: {e}")
-                    elif isinstance(comp, Reply) and comp.chain:
-                        for reply_comp in comp.chain:
-                            if isinstance(reply_comp, Image):
-                                try:
-                                    input_images.append(await reply_comp.convert_to_base64())
-                                except Exception as e:
-                                    logger.warning(f"转换引用消息中的参考图片到base64失败: {e}")
+                        except Exception as e:
+                            logger.error(f"处理当前消息中的图片时出现未预期的错误: {e}")
+                    elif isinstance(comp, Reply):
+                        # 修复引用消息中的图片获取逻辑
+                        # Reply组件的chain字段包含被引用的消息内容
+                        if comp.chain:
+                            for reply_comp in comp.chain:
+                                if isinstance(reply_comp, Image):
+                                    try:
+                                        base64_data = await reply_comp.convert_to_base64()
+                                        input_images.append(base64_data)
+                                        logger.info(f"从引用消息中获取到图片")
+                                    except (IOError, ValueError, OSError) as e:
+                                        logger.warning(f"转换引用消息中的参考图片到base64失败: {e}")
+                                    except Exception as e:
+                                        logger.error(f"处理引用消息中的图片时出现未预期的错误: {e}")
+                        else:
+                            logger.debug("引用消息的chain为空，无法获取图片内容")
             
+            # 记录使用的图片数量
             if input_images:
                 logger.info(f"使用了 {len(input_images)} 张参考图片进行图像生成")
             else:
                 logger.info("未找到参考图片，执行纯文本图像生成")
 
+        # 调用生成图像的函数
         try:
             image_url, image_path = await generate_image_openrouter(
-                image_description, self.openrouter_api_keys, model=self.model_name,
-                input_images=input_images, api_base=self.custom_api_base or None,
+                image_description,
+                openrouter_api_keys,
+                model=self.model_name,
+                input_images=input_images,
+                api_base=self.custom_api_base if self.custom_api_base else None,
                 max_retry_attempts=self.max_retry_attempts
             )
             
             if not image_url or not image_path:
-                yield event.plain_result("图像生成失败，请检查API配置和网络连接。")
+                # 生成失败，发送错误消息
+                error_chain = [Plain("图像生成失败，请检查API配置和网络连接。")]
+                yield event.chain_result(error_chain)
                 return
             
+            # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
                 image_path = await send_file(image_path, host=self.nap_server_address, port=self.nap_server_port)
             
+            # 使用新的发送方法，优先使用callback_api_base
             image_component = await self.send_image_with_callback_api(image_path)
-            chain = [image_component, Plain(message)] if message else [image_component]
+            chain = [image_component, Plain(message)]
             yield event.chain_result(chain)
-            
+            return
+                
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"网络连接错误导致图像生成失败: {e}")
+            error_chain = [Plain(f"网络连接错误，图像生成失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+            return
+        except ValueError as e:
+            logger.error(f"参数错误导致图像生成失败: {e}")
+            error_chain = [Plain(f"参数错误，图像生成失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+            return
         except Exception as e:
             logger.error(f"图像生成过程出现未预期的错误: {e}")
-            yield event.plain_result(f"图像生成失败: {str(e)}")
+            error_chain = [Plain(f"图像生成失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+            return
 
     @filter.command_group("banana")
     def banan(self):
@@ -287,23 +426,26 @@ class MyPlugin(Star):
         await self._load_global_config()
         
         if not new_base_url:
-            current_url = self.custom_api_base or "https://openrouter.ai/api/v1"
-            yield event.plain_result(f"当前 base URL: {current_url}\n使用方法:\n/banan baseurl <新的base_url> [true] - true表示永久保存")
+            current_url = self.custom_api_base if self.custom_api_base else "https://openrouter.ai/api/v1"
+            yield event.plain_result(f"当前 base URL: {current_url}\n使用方法:\n/banan baseurl <新的base_url> - 临时切换\n/banan baseurl <新的base_url> true - 永久保存")
             return
         
+        # 更新当前实例的配置
         self.custom_api_base = new_base_url.strip()
         
+        # 根据 save_global 参数决定是否保存到全局配置
         if save_global.lower() in ["true", "1", "yes", "y"]:
             try:
+                # 获取插件的全局配置
                 plugin_config = await sp.global_get("gemini-25-image-openrouter", {})
-                plugin_config["custom_api_base"] = self.custom_api_base
+                plugin_config["custom_api_base"] = new_base_url.strip()
                 await sp.global_put("gemini-25-image-openrouter", plugin_config)
-                yield event.plain_result(f"已永久切换 base URL 到: {self.custom_api_base}")
+                yield event.plain_result(f"已永久切换 base URL 到: {new_base_url}（已保存到全局配置）")
             except Exception as e:
                 logger.error(f"保存全局配置失败: {e}")
-                yield event.plain_result(f"已临时切换 base URL，但保存全局配置失败: {str(e)}")
+                yield event.plain_result(f"已临时切换 base URL 到: {new_base_url}（保存全局配置失败: {str(e)}）")
         else:
-            yield event.plain_result(f"已临时切换 base URL 到: {self.custom_api_base}")
+            yield event.plain_result(f"已临时切换 base URL 到: {new_base_url}（会话级别，重启后恢复）")
 
     @banan.command("model")
     async def switch_model(self, event: AstrMessageEvent, new_model: str = None, save_global: str = "false"):
@@ -320,56 +462,76 @@ class MyPlugin(Star):
         await self._load_global_config()
         
         if not new_model:
-            yield event.plain_result(f"当前模型: {self.model_name}\n使用方法:\n/banan model <模型名> [true] - true表示永久保存")
+            yield event.plain_result(f"当前模型: {self.model_name}\n使用方法:\n/banan model <模型名> - 临时切换\n/banan model <模型名> true - 永久保存\n例如: /banan model google/gemini-2.5-flash-image-preview:free")
             return
         
+        # 更新当前实例的配置，使用用户输入的完整准确的模型名
         self.model_name = new_model.strip()
         
+        # 根据 save_global 参数决定是否保存到全局配置
         if save_global.lower() in ["true", "1", "yes", "y"]:
             try:
+                # 获取插件的全局配置
                 plugin_config = await sp.global_get("gemini-25-image-openrouter", {})
-                plugin_config["model_name"] = self.model_name
+                plugin_config["model_name"] = new_model.strip()
                 await sp.global_put("gemini-25-image-openrouter", plugin_config)
-                yield event.plain_result(f"已永久切换模型到: {self.model_name}")
+                yield event.plain_result(f"已永久切换模型到: {new_model}（已保存到全局配置）")
             except Exception as e:
                 logger.error(f"保存全局配置失败: {e}")
-                yield event.plain_result(f"已临时切换模型，但保存全局配置失败: {str(e)}")
+                yield event.plain_result(f"已临时切换模型到: {new_model}（保存全局配置失败: {str(e)}）")
         else:
-            yield event.plain_result(f"已临时切换模型到: {self.model_name}")
+            yield event.plain_result(f"已临时切换模型到: {new_model}（会话级别，重启后恢复）")
 
     @filter.command("手办化")
     async def figure_transform(self, event: AstrMessageEvent):
-        """将用户提供的图片转换为手办效果"""
+        """将用户提供的图片转换为手办效果
+        
+        使用方法：发送图片并使用 /手办化 指令
+        """
+        # 检查频率限制
         can_draw, message = await self._check_and_update_limit(event)
         if not can_draw:
             yield event.plain_result(message)
             return
             
+        # 加载全局配置，确保使用最新的配置
         await self._load_global_config()
         
+        # 检查消息中是否包含图片
         input_images = []
         if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'message'):
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
                     try:
-                        input_images.append(await comp.convert_to_base64())
-                    except Exception as e:
+                        base64_data = await comp.convert_to_base64()
+                        input_images.append(base64_data)
+                    except (IOError, ValueError, OSError) as e:
                         logger.warning(f"转换图片到base64失败: {e}")
-                elif isinstance(comp, Reply) and comp.chain:
-                    for reply_comp in comp.chain:
-                        if isinstance(reply_comp, Image):
-                            try:
-                                input_images.append(await reply_comp.convert_to_base64())
-                            except Exception as e:
-                                logger.warning(f"转换引用消息中的图片到base64失败: {e}")
+                    except Exception as e:
+                        logger.error(f"处理图片时出现未预期的错误: {e}")
+                elif isinstance(comp, Reply):
+                    # 处理引用消息中的图片
+                    if comp.chain:
+                        for reply_comp in comp.chain:
+                            if isinstance(reply_comp, Image):
+                                try:
+                                    base64_data = await reply_comp.convert_to_base64()
+                                    input_images.append(base64_data)
+                                    logger.info(f"从引用消息中获取到图片")
+                                except (IOError, ValueError, OSError) as e:
+                                    logger.warning(f"转换引用消息中的图片到base64失败: {e}")
+                                except Exception as e:
+                                    logger.error(f"处理引用消息中的图片时出现未预期的错误: {e}")
         
+        # 检查是否找到图片
         if not input_images:
-            yield event.plain_result("请提供一张图片以进行手办化处理！")
+            yield event.plain_result("请提供一张图片以进行手办化处理！\n发送图片后使用 /手办化 指令，或者回复包含图片的消息并使用 /手办化 指令。")
             return
         
         logger.info(f"开始手办化处理，使用了 {len(input_images)} 张图片")
         
-        figure_prompt =  """Please accurately transform the main subject in this image into a realistic, masterpiece-quality 1/7 scale PVC figure.
+        # 使用专门的手办化提示词
+        figure_prompt = """Please accurately transform the main subject in this image into a realistic, masterpiece-quality 1/7 scale PVC figure.
 
 Specific Requirements:
 1. **Figure Creation**: Convert the subject into a high-quality PVC figure with obvious three-dimensional depth and the characteristic glossy finish of PVC material
@@ -393,25 +555,40 @@ Please ensure the final result looks like a real commercial figure product that 
 
         try:
             image_url, image_path = await generate_image_openrouter(
-                figure_prompt, self.openrouter_api_keys, model=self.model_name,
-                input_images=input_images, api_base=self.custom_api_base or None,
+                figure_prompt,
+                self.openrouter_api_keys,
+                model=self.model_name,
+                input_images=input_images,
+                api_base=self.custom_api_base if self.custom_api_base else None,
                 max_retry_attempts=self.max_retry_attempts
             )
             
             if not image_url or not image_path:
-                yield event.plain_result("手办化处理失败，请检查API配置和网络连接。")
+                error_chain = [Plain("手办化处理失败，请检查API配置和网络连接。")]
+                yield event.chain_result(error_chain)
                 return
             
+            # 处理文件传输和图片发送
             if self.nap_server_address and self.nap_server_address != "localhost":
                 image_path = await send_file(image_path, host=self.nap_server_address, port=self.nap_server_port)
             
+            # 发送处理结果
             image_component = await self.send_image_with_callback_api(image_path)
-            result_chain = [Plain("✨ 手办化处理完成！"), image_component, Plain(message)] if message else [Plain("✨ 手办化处理完成！"), image_component]
+            result_chain = [Plain("✨ 手办化处理完成！"), image_component, Plain(message)]
             yield event.chain_result(result_chain)
             
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"网络连接错误导致手办化处理失败: {e}")
+            error_chain = [Plain(f"网络连接错误，手办化处理失败: {str(e)}")]
+            yield event.chain_result(error_chain)
+        except ValueError as e:
+            logger.error(f"参数错误导致手办化处理失败: {e}")
+            error_chain = [Plain(f"参数错误，手办化处理失败: {str(e)}")]
+            yield event.chain_result(error_chain)
         except Exception as e:
             logger.error(f"手办化处理过程出现未预期的错误: {e}")
-            yield event.plain_result(f"手办化处理失败: {str(e)}")
+            error_chain = [Plain(f"手办化处理失败: {str(e)}")]
+            yield event.chain_result(error_chain)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("reset_images")
