@@ -93,14 +93,24 @@ class MyPlugin(Star):
         
         # 确定适用的限制
         limit = self.rate_limit_config.get("default_limit", 10)
-        # 优先用户限制，其次群组限制，最后默认限制
-        user_limit_config = next((item for item in self.rate_limit_config.get("user_limits", []) if item.get("user_id") == user_id), None)
-        if user_limit_config:
-            limit = user_limit_config.get("limit", limit)
+        
+        # 优先用户限制
+        user_limits = self.rate_limit_config.get("user_limits", [])
+        if isinstance(user_limits, list):
+            user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
+            if user_limit_config:
+                limit = user_limit_config.get("limit", limit)
         else:
-            group_limit_config = next((item for item in self.rate_limit_config.get("group_limits", []) if item.get("group_id") == group_id), None)
+            logger.warning("配置中的 user_limits 格式不正确，应为列表")
+
+        # 其次群组限制
+        group_limits = self.rate_limit_config.get("group_limits", [])
+        if isinstance(group_limits, list):
+            group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
             if group_limit_config:
                 limit = group_limit_config.get("limit", limit)
+        else:
+            logger.warning("配置中的 group_limits 格式不正确，应为列表")
 
         # 检查使用记录
         today = datetime.now().strftime("%Y-%m-%d")
