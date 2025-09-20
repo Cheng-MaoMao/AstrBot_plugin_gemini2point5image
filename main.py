@@ -1,3 +1,6 @@
+import json
+import os
+from datetime import datetime
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, sp
@@ -6,7 +9,7 @@ from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
-@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.8")
+@register("gemini-25-image-openrouter", "喵喵", "使用openrouter的免费api生成图片", "1.9")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -28,6 +31,12 @@ class MyPlugin(Star):
         
         self.nap_server_address = config.get("nap_server_address")
         self.nap_server_port = config.get("nap_server_port")
+
+        # 绘图限制配置
+        self.rate_limit_config = config.get("rate_limit", {})
+        self.usage_records = {}
+        self.usage_records_path = os.path.join("data", "gemini-25-image-openrouter", "usage_records.json")
+        self._load_usage_records()
         
         # 标记是否已经加载过全局配置
         self._global_config_loaded = False
@@ -53,6 +62,68 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"加载全局配置失败: {e}")
             self._global_config_loaded = True  # 即使失败也标记为已加载，避免重复尝试
+
+    def _load_usage_records(self):
+        """加载使用记录"""
+        try:
+            if os.path.exists(self.usage_records_path):
+                with open(self.usage_records_path, "r", encoding="utf-8") as f:
+                    self.usage_records = json.load(f)
+            else:
+                # 如果文件不存在，创建目录
+                os.makedirs(os.path.dirname(self.usage_records_path), exist_ok=True)
+        except Exception as e:
+            logger.error(f"加载绘图使用记录失败: {e}")
+
+    def _save_usage_records(self):
+        """保存使用记录"""
+        try:
+            with open(self.usage_records_path, "w", encoding="utf-8") as f:
+                json.dump(self.usage_records, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"保存绘图使用记录失败: {e}")
+
+    async def _check_and_update_limit(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """检查并更新绘图次数限制"""
+        if not self.rate_limit_config.get("enabled", False):
+            return True, ""
+
+        user_id = event.get_sender_id()
+        group_id = event.get_group_id()
+        
+        # 确定适用的限制
+        limit = self.rate_limit_config.get("default_limit", 10)
+        # 优先用户限制，其次群组限制，最后默认限制
+        user_limit_config = next((item for item in self.rate_limit_config.get("user_limits", []) if item.get("user_id") == user_id), None)
+        if user_limit_config:
+            limit = user_limit_config.get("limit", limit)
+        else:
+            group_limit_config = next((item for item in self.rate_limit_config.get("group_limits", []) if item.get("group_id") == group_id), None)
+            if group_limit_config:
+                limit = group_limit_config.get("limit", limit)
+
+        # 检查使用记录
+        today = datetime.now().strftime("%Y-%m-%d")
+        record_key = f"user_{user_id}" if group_id else f"user_{user_id}" # 私聊和群聊都基于用户ID
+        if group_id:
+             record_key = f"group_{group_id}" # 群聊基于群ID
+
+        user_record = self.usage_records.get(record_key, {"date": today, "count": 0})
+
+        # 如果日期不是今天，重置计数
+        if user_record.get("date") != today:
+            user_record = {"date": today, "count": 0}
+
+        if user_record["count"] >= limit:
+            return False, f"您今天已经达到绘图次数上限（{limit}次），请明天再来吧。"
+
+        # 更新记录
+        user_record["count"] += 1
+        self.usage_records[record_key] = user_record
+        self._save_usage_records()
+
+        remaining = limit - user_record["count"]
+        return True, f"绘图成功！您今天还剩余 {remaining} 次绘图机会。"
 
     async def send_image_with_callback_api(self, image_path: str) -> Image:
         """
@@ -119,6 +190,12 @@ class MyPlugin(Star):
             - image_description (string): Description of the image to generate. Translate to English can be better.
             - use_reference_images (bool): Whether to use images from the user's message as reference. Default True.
         """
+        # 检查频率限制
+        can_draw, message = await self._check_and_update_limit(event)
+        if not can_draw:
+            yield event.plain_result(message)
+            return
+
         # 加载全局配置，确保使用最新的配置
         await self._load_global_config()
         
@@ -186,7 +263,7 @@ class MyPlugin(Star):
             
             # 使用新的发送方法，优先使用callback_api_base
             image_component = await self.send_image_with_callback_api(image_path)
-            chain = [image_component]
+            chain = [image_component, Plain(message)]
             yield event.chain_result(chain)
             return
                 
@@ -286,6 +363,12 @@ class MyPlugin(Star):
         
         使用方法：发送图片并使用 /手办化 指令
         """
+        # 检查频率限制
+        can_draw, message = await self._check_and_update_limit(event)
+        if not can_draw:
+            yield event.plain_result(message)
+            return
+            
         # 加载全局配置，确保使用最新的配置
         await self._load_global_config()
         
@@ -366,7 +449,7 @@ Please ensure the final result looks like a real commercial figure product that 
             
             # 发送处理结果
             image_component = await self.send_image_with_callback_api(image_path)
-            result_chain = [Plain("✨ 手办化处理完成！"), image_component]
+            result_chain = [Plain("✨ 手办化处理完成！"), image_component, Plain(message)]
             yield event.chain_result(result_chain)
             
         except (ConnectionError, TimeoutError) as e:
