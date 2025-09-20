@@ -1,12 +1,11 @@
 import json
 import os
 from datetime import datetime
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, llm_tool
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, sp
 from astrbot.api.message_components import Image, Plain
 from astrbot.core.message.components import Reply
-from astrbot.api.all import *
 from .utils.ttp import generate_image_openrouter
 from .utils.file_send_server import send_file
 
@@ -167,7 +166,7 @@ class MyPlugin(Star):
             logger.error(f"发送图片时出现未预期的错误: {e}，将退回到本地文件发送")
             return Image.fromFileSystem(image_path)
 
-    @llm_tool(name="gemini-pic-gen")
+    @filter.llm_tool(name="gemini-pic-gen")
     async def pic_gen(self, event: AstrMessageEvent, image_description: str, use_reference_images: bool = True):
         """
             Generate or modify images using the Gemini model via the OpenRouter API.
