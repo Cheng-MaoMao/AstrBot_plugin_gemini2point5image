@@ -140,10 +140,17 @@ class MyPlugin(Star):
         # 检查是否存在针对该用户的特定限制
         user_limits = self.rate_limit_config.get("user_limits", [])
         if isinstance(user_limits, list):
-            user_limit_config = next((item for item in user_limits if isinstance(item, dict) and item.get("user_id") == user_id), None)
-            if user_limit_config:
-                limit = user_limit_config.get("limit")
-                limit_type = "用户"
+            for item in user_limits:
+                # 兼容对象列表格式: {"user_id": "123", "limit": 20}
+                if isinstance(item, dict) and item.get("user_id") == user_id:
+                    limit = item.get("limit")
+                    limit_type = "用户"
+                    break
+                # 兼容字符串列表格式: "123"
+                elif isinstance(item, str) and item == user_id:
+                    limit = self.rate_limit_config.get("default_limit", 10) # 使用默认限制
+                    limit_type = "用户"
+                    break
         else:
             logger.warning("配置中的 user_limits 格式不正确，应为列表")
 
@@ -151,10 +158,17 @@ class MyPlugin(Star):
         if limit is None and group_id:
             group_limits = self.rate_limit_config.get("group_limits", [])
             if isinstance(group_limits, list):
-                group_limit_config = next((item for item in group_limits if isinstance(item, dict) and item.get("group_id") == group_id), None)
-                if group_limit_config:
-                    limit = group_limit_config.get("limit")
-                    limit_type = "群组"
+                for item in group_limits:
+                    # 兼容对象列表格式: {"group_id": "123", "limit": 20}
+                    if isinstance(item, dict) and item.get("group_id") == group_id:
+                        limit = item.get("limit")
+                        limit_type = "群组"
+                        break
+                    # 兼容字符串列表格式: "123"
+                    elif isinstance(item, str) and item == group_id:
+                        limit = self.rate_limit_config.get("default_limit", 10)
+                        limit_type = "群组"
+                        break
             else:
                 logger.warning("配置中的 group_limits 格式不正确，应为列表")
 
