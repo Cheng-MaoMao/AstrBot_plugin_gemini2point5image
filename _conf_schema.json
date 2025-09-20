@@ -50,7 +50,7 @@
                 "default": false
             },
             "default_limit": {
-                "description": "默认的每日绘图次数限制",
+                "description": "对已列出的用户/群组生效的默认次数限制",
                 "type": "int",
                 "default": 10
             },
